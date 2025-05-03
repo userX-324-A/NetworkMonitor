@@ -1,0 +1,71 @@
+﻿<Window x:Class="NetworkMonitorUI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:local="clr-namespace:NetworkMonitorUI"
+        xmlns:materialDesign="http://materialdesigninxaml.net/winfx/xaml/themes" 
+        mc:Ignorable="d"
+        Title="Network and Disk Monitor" Height="600" Width="800"
+        Loaded="Window_Loaded"
+        Closing="Window_Closing"
+        TextElement.Foreground="{DynamicResource MaterialDesignBody}"
+        Background="{DynamicResource MaterialDesignPaper}"
+        TextElement.FontWeight="Regular"
+        TextElement.FontSize="13">
+
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Use Material Design TabControl -->
+        <TabControl Grid.Row="0" Margin="0,0,0,5"
+                    Style="{StaticResource MaterialDesignFilledTabControl}"> 
+            <TabItem Header="Network Stats">
+                <Grid Margin="5"> 
+                    <DataGrid x:Name="NetworkStatsGrid"
+                              ItemsSource="{Binding ProcessStats}"
+                              AutoGenerateColumns="False"
+                              IsReadOnly="True"
+                              Style="{StaticResource MaterialDesignDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="PID" Binding="{Binding ProcessId}" Width="SizeToCells" MinWidth="60"/>
+                            <DataGridTextColumn Header="Process Name" Binding="{Binding ProcessName}" Width="*"/>
+                            <DataGridTextColumn Header="Bytes Sent" Binding="{Binding TotalBytesSent, StringFormat={}{0:N0}}" Width="SizeToHeader" ElementStyle="{StaticResource MaterialDesignDataGridTextColumnStyle}"/>
+                            <DataGridTextColumn Header="Bytes Received" Binding="{Binding TotalBytesReceived, StringFormat={}{0:N0}}" Width="SizeToHeader" ElementStyle="{StaticResource MaterialDesignDataGridTextColumnStyle}"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                 </Grid>
+            </TabItem>
+
+            <TabItem Header="Disk Stats">
+                 <Grid Margin="5"> 
+                    <DataGrid x:Name="DiskStatsGrid"
+                              ItemsSource="{Binding DiskStats}"
+                              AutoGenerateColumns="False"
+                              IsReadOnly="True"
+                              Style="{StaticResource MaterialDesignDataGrid}">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="PID" Binding="{Binding ProcessId}" Width="SizeToCells" MinWidth="60"/>
+                            <DataGridTextColumn Header="Process Name" Binding="{Binding ProcessName}" Width="*"/>
+                            <DataGridTextColumn Header="Bytes Read" Binding="{Binding TotalBytesRead, StringFormat={}{0:N0}}" Width="SizeToHeader" ElementStyle="{StaticResource MaterialDesignDataGridTextColumnStyle}"/>
+                            <DataGridTextColumn Header="Bytes Written" Binding="{Binding TotalBytesWritten, StringFormat={}{0:N0}}" Width="SizeToHeader" ElementStyle="{StaticResource MaterialDesignDataGridTextColumnStyle}"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                 </Grid>
+            </TabItem>
+        </TabControl>
+
+        <!-- Material Design Status Bar -->
+        <StatusBar Grid.Row="1">
+            <StatusBarItem>
+                <TextBlock x:Name="StatusTextBlock" Text="Ready"/>
+            </StatusBarItem>
+            <StatusBarItem HorizontalAlignment="Right">
+                <Button x:Name="ResetButton" Content="Reset Totals" Click="ResetButton_Click" Style="{StaticResource MaterialDesignFlatButton}" />
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>

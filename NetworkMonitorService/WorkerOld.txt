@@ -1,0 +1,863 @@
+Worker.cs
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Net; // Added for IPAddress
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Microsoft.Diagnostics.Tracing;
+using Microsoft.Diagnostics.Tracing.Session;
+using Microsoft.Diagnostics.Tracing.Parsers;
+using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
+using NetworkMonitorService.Models; // Added for DB Models
+using Microsoft.Extensions.DependencyInjection; // Added for IServiceScopeFactory
+using Microsoft.EntityFrameworkCore; // Added for DbContext/logging errors
+using EFCore.BulkExtensions; // <<< ADDING BACK using statement
+// using NetworkMonitorService.Wfp; // Commented out - WfpController is in base namespace
+using System.Text.Json; // For serialization in DTO
+using System.Threading; // Added for Timer and Interlocked
+using System.IO.Pipes; // Added for Named Pipes
+using System.Text; // Added for Encoding
+using System; 
+using System.Threading.Tasks; 
+using System.Linq; 
+using System.Collections.Generic; // Added for List
+
+namespace NetworkMonitorService;
+
+public class Worker : BackgroundService
+{
+    private readonly ILogger<Worker> _logger;
+    private readonly ILoggerFactory _loggerFactory; // To create logger for WfpController
+    private readonly IServiceScopeFactory _scopeFactory; // Ensure this is injected
+    private TraceEventSession? _etwSession;
+    private readonly ConcurrentDictionary<int, ProcessNetworkStats> _processStats = new();
+    private readonly ConcurrentDictionary<int, ProcessDiskStats> _processDiskStats = new(); // Added for Disk Stats
+    private Timer? _loggingTimer;
+    private readonly TimeSpan _logInterval = TimeSpan.FromMinutes(1); // Log every minute
+    private WfpController? _wfpController; // Reference to our WFP controller
+
+    // Inject ILoggerFactory to create logger for WfpController
+    public Worker(ILogger<Worker> logger, ILoggerFactory loggerFactory, IServiceScopeFactory scopeFactory)
+    {
+        _logger = logger;
+        _loggerFactory = loggerFactory;
+        _scopeFactory = scopeFactory; // Assign injected factory
+    }
+
+    public override Task StartAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Worker starting...");
+
+        // Initialize WFP Controller here
+        _logger.LogInformation("Initializing WFP Controller...");
+        try
+        {
+             // Create logger specifically for WfpController
+            var wfpLogger = _loggerFactory.CreateLogger<WfpController>();
+            _wfpController = new WfpController(wfpLogger);
+            if (!_wfpController.Initialize())
+            {
+                _logger.LogError("WFP Controller initialization failed. Network blocking functionality will be unavailable.");
+                // Decide how to handle this - continue without blocking, or stop the service?
+                // For now, we log the error and continue.
+                _wfpController.Dispose(); // Clean up partially initialized controller
+                _wfpController = null;
+            }
+             else
+             {
+                 _logger.LogInformation("WFP Controller initialized successfully.");
+             }
+        }
+        catch (Exception ex)
+        {
+             _logger.LogError(ex, "Exception during WFP Controller initialization.");
+             _wfpController?.Dispose(); // Ensure disposal on error
+             _wfpController = null;
+        }
+
+        return base.StartAsync(cancellationToken);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        _logger.LogInformation("Initializing ETW session for network monitoring.");
+
+        string sessionName = "NetworkMonitorServiceSession"; // Must be unique
+        TraceEventDispatcher? etwSource = null; // Declare here for broader scope check
+
+        try
+        {
+            _logger.LogDebug("Creating TraceEventSession...");
+            _etwSession = new TraceEventSession(sessionName, TraceEventSessionOptions.Create);
+            _logger.LogDebug("TraceEventSession created. Is session null? {IsNull}", _etwSession == null);
+
+            // Use a cancellation token source linked to the service stopping token
+            var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+
+            // Register cancellation callback to dispose the session and timer
+            stoppingToken.Register(() =>
+            {
+                _logger.LogInformation("Stopping token received, disposing resources.");
+                _loggingTimer?.Change(Timeout.Infinite, 0); // Stop the timer
+                StopMonitoring();
+                cts.Cancel(); // Signal cancellation to the processing task
+            });
+
+            _logger.LogDebug("Enabling Kernel Providers (NetworkTCPIP, FileIO, FileIOInit)...");
+            // Enable Kernel Network Events AND File I/O Events
+            _etwSession.EnableKernelProvider(
+                KernelTraceEventParser.Keywords.NetworkTCPIP |
+                KernelTraceEventParser.Keywords.FileIO |       // Use FileIO for file name info
+                KernelTraceEventParser.Keywords.FileIOInit    // Use FileIOInit for file name info
+                );
+            _logger.LogDebug("Kernel Providers enabled.");
+            _logger.LogInformation("*** DIAGNOSTIC: Kernel providers enabled successfully. ***");
+
+            // Check if Source is available
+            if (_etwSession == null)
+            {
+                _logger.LogError("ETW Session is null before trying to access Source.");
+                throw new InvalidOperationException("ETW Session became null unexpectedly.");
+            }
+            etwSource = _etwSession.Source;
+            _logger.LogDebug("ETW Session Source acquired. Is source null? {IsNull}", etwSource == null);
+
+            if (etwSource == null)
+            {
+                _logger.LogError("ETW Session Source is null, cannot subscribe to events.");
+                throw new InvalidOperationException("ETW Session Source is null after enabling providers.");
+            }
+
+            // Check if Kernel source is available
+            var kernelSource = etwSource.Kernel;
+             _logger.LogDebug("Kernel Source acquired. Is kernel source null? {IsNull}", kernelSource == null);
+
+             if (kernelSource == null)
+             {
+                 _logger.LogError("Kernel Source is null, cannot subscribe to kernel events.");
+                 throw new InvalidOperationException("Kernel Source is null after acquiring session source.");
+             }
+
+            // Set up event handlers
+             _logger.LogDebug("Subscribing to Kernel events (TcpIpRecv, TcpIpSend, All)...");
+            kernelSource.TcpIpRecv += HandleTcpIpRecv;
+            kernelSource.TcpIpSend += HandleTcpIpSend;
+            // Add UDP handlers if needed
+            // kernelSource.UdpIpRecv += HandleUdpIpRecv;
+            // kernelSource.UdpIpSend += HandleUdpIpSend;
+
+            // Subscribe to *all* Kernel events
+            // kernelSource.All += HandleKernelEvent; // REMOVED - Using specific handlers now
+
+            // Subscribe to specific Disk IO events
+            _logger.LogDebug("Subscribing to FileIO events (FileIORead, FileIOWrite)...");
+            kernelSource.FileIORead += HandleFileIoRead;   // Use FileIORead
+            kernelSource.FileIOWrite += HandleFileIoWrite; // Use FileIOWrite
+
+            _logger.LogInformation("*** DIAGNOSTIC: Subscribed FileIORead/Write handlers. ***");
+
+             _logger.LogDebug("Kernel event subscriptions complete.");
+
+            // Set up periodic logging timer
+             _logger.LogDebug("Setting up logging timer...");
+            _loggingTimer = new Timer(LogStats, null, _logInterval, _logInterval);
+             _logger.LogDebug("Logging timer set up.");
+
+            // Process events on a separate thread
+            _logger.LogInformation("Starting ETW event processing task...");
+            var etwTask = Task.Run(() =>
+            {
+                // Capture the source for use in the task
+                var sourceToProcess = etwSource; 
+                try
+                {
+                     _logger.LogInformation("ETW Task: Checking if sourceToProcess is null...");
+                     if (sourceToProcess != null)
+                     {
+                         _logger.LogInformation("*** DIAGNOSTIC: ETW Task starting Source.Process()... ***");
+                         _logger.LogInformation("ETW Task: Calling Source.Process()...");
+                         sourceToProcess.Process(); // Use the captured source variable
+                         _logger.LogInformation("ETW Task: Source.Process() completed normally.");
+                         _logger.LogInformation("*** DIAGNOSTIC: ETW Task Source.Process() finished normally. ***");
+                     }
+                     else
+                     {
+                         _logger.LogError("ETW Task: sourceToProcess is null, cannot process events.");
+                     }
+                }
+                catch (OperationCanceledException) { 
+                    _logger.LogInformation("ETW processing cancelled.");
+                    _logger.LogWarning("*** DIAGNOSTIC: ETW Task Source.Process() cancelled. ***");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error during ETW event processing.");
+                    _logger.LogError(ex, "*** DIAGNOSTIC: ETW Task Source.Process() threw exception. ***");
+                }
+                finally
+                {
+                    _logger.LogInformation("ETW event processing stopped.");
+                    _logger.LogInformation("*** DIAGNOSTIC: ETW Task finally block reached. ***");
+                    // Ensure session is disposed if Process() exits unexpectedly
+                    StopMonitoring(); 
+                }
+            }, cts.Token); 
+
+            // Wait for only the ETW task to complete or cancellation
+            await etwTask.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to initialize ETW session. Ensure the service runs with administrative privileges.");
+            return; // Exit if session creation fails
+        }
+        finally
+        {
+             _logger.LogInformation("ExecuteAsync finished.");
+        }
+    }
+
+    // --- Public methods for API access ---
+
+    /// <summary>
+    /// Retrieves the current snapshot of network statistics for all monitored processes.
+    /// </summary>
+    /// <returns>An AllProcessStatsDto containing the statistics.</returns>
+    public AllProcessStatsDto GetCurrentStatsForDto()
+    {
+        var result = new AllProcessStatsDto();
+        foreach (var kvp in _processStats)
+        {
+            var stats = kvp.Value;
+            if (stats.ProcessName == "Unknown")
+            { TryResolveProcessName(stats); }
+
+            // Check blocked status using WfpController
+            bool isBlocked = _wfpController?.IsProcessBlocked(stats.ProcessId) ?? false;
+
+            result.Stats.Add(new ProcessStatsDto
+            {
+                ProcessId = stats.ProcessId,
+                ProcessName = stats.ProcessName,
+                TotalBytesSent = stats.GetTotalBytesSent(), 
+                TotalBytesReceived = stats.GetTotalBytesReceived(),
+                IsBlocked = isBlocked // Set the IsBlocked property
+            });
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Retrieves the current snapshot of disk I/O statistics for all monitored processes.
+    /// </summary>
+    /// <returns>An AllProcessDiskStatsDto containing the statistics.</returns>
+    public AllProcessDiskStatsDto GetCurrentDiskStatsForDto()
+    {
+        var result = new AllProcessDiskStatsDto();
+        foreach (var kvp in _processDiskStats) // Iterate through disk stats
+        {
+            var stats = kvp.Value;
+            if (stats.ProcessName == "Unknown")
+            { TryResolveProcessName(stats); } // Resolve name if needed
+
+            result.Stats.Add(new ProcessDiskStatsDto
+            {
+                ProcessId = stats.ProcessId,
+                ProcessName = stats.ProcessName,
+                TotalBytesRead = stats.GetTotalBytesRead(), // Use method from ProcessDiskStats
+                TotalBytesWritten = stats.GetTotalBytesWritten() // Use method from ProcessDiskStats
+            });
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Blocks network access for a specific process ID using WFP.
+    /// </summary>
+    /// <param name="processId">The ID of the process to block.</param>
+    /// <returns>True if the block rule was added successfully, false otherwise.</returns>
+    public bool BlockProcess(int processId)
+    {
+        if (_wfpController == null)
+        {
+            _logger.LogWarning("Attempted to block PID {ProcessId}, but WFP Controller is not initialized.", processId);
+            return false;
+        }
+        try
+        {
+            _logger.LogInformation("API request received to block PID {ProcessId}", processId);
+            return _wfpController.BlockProcess(processId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error blocking process {ProcessId}", processId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Unblocks network access for a specific process ID by removing the WFP rule.
+    /// </summary>
+    /// <param name="processId">The ID of the process to unblock.</param>
+    /// <returns>True if the block rule was removed successfully, false otherwise.</returns>
+    public bool UnblockProcess(int processId)
+    {
+        if (_wfpController == null)
+        {
+            _logger.LogWarning("Attempted to unblock PID {ProcessId}, but WFP Controller is not initialized.", processId);
+            return false;
+        }
+        try
+        {
+            _logger.LogInformation("API request received to unblock PID {ProcessId}", processId);
+            return _wfpController.UnblockProcess(processId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error unblocking process {ProcessId}", processId);
+            return false;
+        }
+    }
+
+    // --- New Generic Kernel Event Handler ---
+    private void HandleKernelEvent(TraceEvent data)
+    {
+        // Log ALL kernel events received by this handler for debugging
+        //_logger.LogTrace("HandleKernelEvent called: PID={PID}, EventName={EventName}, Opcode={Opcode}, TaskName={TaskName}, ProviderName={ProviderName}",
+        //                 data.ProcessID, data.EventName, data.Opcode, data.TaskName, data.ProviderName);
+
+        // --- COMMENTED OUT FILE IO LOGIC ---
+        /*
+        // Filter for FileIO Task events
+        if (data.TaskName == "FileIO")
+        {
+            // Expanded logging for debugging FileIO events
+            _logger.LogDebug("Received FileIO Event: PID={PID}, EventName={EventName}, Opcode={Opcode}, TaskName={TaskName}",
+                             data.ProcessID, data.EventName, data.Opcode, data.TaskName);
+
+            bool isReadOperation = false;
+            bool isWriteOperation = false;
+            long ioSize = 0;
+            object? sizePayload = null;
+
+            // Check Opcode for Read
+            if (data.Opcode == (TraceEventOpcode)10) // Tentative Read Opcode
+            {
+                isReadOperation = true;
+                sizePayload = data.PayloadByName("IoSize");
+                _logger.LogTrace("FileIO PID {PID}: Read Opcode (10) detected. IoSize payload type: {Type}", data.ProcessID, sizePayload?.GetType()?.Name ?? "null");
+            }
+            // Check Opcode for Write
+            else if (data.Opcode == (TraceEventOpcode)11) // Tentative Write Opcode
+            {
+                isWriteOperation = true;
+                sizePayload = data.PayloadByName("IoSize");
+                 _logger.LogTrace("FileIO PID {PID}: Write Opcode (11) detected. IoSize payload type: {Type}", data.ProcessID, sizePayload?.GetType()?.Name ?? "null");
+            }
+            else
+            {
+                 _logger.LogTrace("FileIO PID {PID}: Opcode {Opcode} is not 10 (Read) or 11 (Write). Skipping.", data.ProcessID, data.Opcode);
+                return; 
+            }
+
+            // Extract size based on detected type
+            if (sizePayload is uint sizeUint)
+            { 
+                ioSize = sizeUint; 
+                _logger.LogTrace("FileIO PID {PID}: Extracted IoSize (uint): {Size}", data.ProcessID, ioSize);
+            }
+            else if (sizePayload is int sizeInt) 
+            { 
+                ioSize = sizeInt; 
+                _logger.LogTrace("FileIO PID {PID}: Extracted IoSize (int): {Size}", data.ProcessID, ioSize);
+            }
+             else if (sizePayload is long sizeLong) // Added check for long
+            { 
+                ioSize = sizeLong; 
+                _logger.LogTrace("FileIO PID {PID}: Extracted IoSize (long): {Size}", data.ProcessID, ioSize);
+            }
+             else if (sizePayload is ulong sizeULong) // Added check for ulong
+            { 
+                ioSize = (long)sizeULong; // Potential for overflow, but necessary for compatibility
+                 _logger.LogTrace("FileIO PID {PID}: Extracted IoSize (ulong): {Size}", data.ProcessID, ioSize);
+            }
+            else if (sizePayload != null)
+            {
+                _logger.LogWarning("FileIO PID {PID}: Unexpected IoSize payload type: {Type}. Value: {Value}", data.ProcessID, sizePayload.GetType().Name, sizePayload);
+            }
+             else
+             {
+                 _logger.LogWarning("FileIO PID {PID}: IoSize payload not found for Opcode {Opcode}.", data.ProcessID, data.Opcode);
+             }
+
+            // If size is valid, update stats
+            if (ioSize > 0)
+            {
+                _logger.LogDebug("FileIO PID {PID}: Updating disk stats - Size: {Size}, IsRead: {IsRead}", data.ProcessID, ioSize, isReadOperation);
+                var diskStats = _processDiskStats.GetOrAdd(data.ProcessID, pid => 
+                {
+                    var newStats = new ProcessDiskStats(pid);
+                    // Attempt to resolve process name immediately
+                    TryResolveProcessName(newStats); // Use adapted TryResolveProcessName
+                    return newStats;
+                });
+                diskStats.UpdateStats(ioSize, isReadOperation);
+            }
+        }
+        */
+        // Can add else if blocks here for other TaskNames if needed (e.g., "DiskIO", "TcpIp")
+    }
+
+    // --- New Disk IO Handlers ---
+    private void HandleFileIoRead(FileIOReadWriteTraceData data) // Renamed method and changed parameter type
+    {
+        // Ignore reads of size 0
+        if (data.IoSize == 0) return;
+
+        // DIAGNOSTIC LOG: Check the received filename
+        _logger.LogDebug("HandleFileIoRead: PID={PID}, Size={Size}, FileName='{FileName}'",
+                         data.ProcessID, data.IoSize, data.FileName ?? "<null or empty>");
+
+        _logger.LogTrace("File Read: PID={PID}, Size={Size}, File={FileName}",
+                         data.ProcessID, data.IoSize, data.FileName);
+
+        var diskStats = _processDiskStats.GetOrAdd(data.ProcessID, pid => 
+        {
+            var newStats = new ProcessDiskStats(pid);
+            TryResolveProcessName(newStats);
+            return newStats;
+        });
+        diskStats.UpdateStats(data.IoSize, true, data.FileName);
+    }
+
+    private void HandleFileIoWrite(FileIOReadWriteTraceData data) // Renamed method and changed parameter type
+    {
+        // Ignore writes of size 0
+        if (data.IoSize == 0) return;
+
+        // DIAGNOSTIC LOG: Check the received filename
+        _logger.LogDebug("HandleFileIoWrite: PID={PID}, Size={Size}, FileName='{FileName}'",
+                         data.ProcessID, data.IoSize, data.FileName ?? "<null or empty>");
+
+        _logger.LogTrace("File Write: PID={PID}, Size={Size}, File={FileName}",
+                         data.ProcessID, data.IoSize, data.FileName);
+        
+        var diskStats = _processDiskStats.GetOrAdd(data.ProcessID, pid => 
+        {
+            var newStats = new ProcessDiskStats(pid);
+            TryResolveProcessName(newStats);
+            return newStats;
+        });
+        diskStats.UpdateStats(data.IoSize, false, data.FileName);
+    }
+
+    // --- ETW Handling and Logging (mostly unchanged) ---
+
+    private void HandleTcpIpSend(TcpIpSendTraceData data)
+    {
+        // Pass remote IP address (destination for send)
+        UpdateStats(data.ProcessID, data.size, isSend: true, data.daddr.ToString());
+    }
+
+    private void HandleTcpIpRecv(TcpIpTraceData data)
+    {
+        // Pass remote IP address (source for receive)
+        UpdateStats(data.ProcessID, data.size, isSend: false, data.saddr.ToString());
+    }
+
+    // Centralized method to update statistics for a process
+    private void UpdateStats(int processId, int size, bool isSend, string remoteIp)
+    {
+        // Get or create the stats object for this process
+        var stats = _processStats.GetOrAdd(processId, pid => 
+        {
+            var newStats = new ProcessNetworkStats(pid);
+            TryResolveProcessName(newStats); // Attempt initial resolution
+            return newStats;
+        });
+
+        // Use the new method in ProcessNetworkStats that handles remote IP
+        stats.UpdateStats(size, isSend, remoteIp);
+    }
+
+    // Adapted TryResolveProcessName to work with both stats types (using an interface might be cleaner later)
+    private void TryResolveProcessName(object statsObj)
+    {
+        int processId = -1;
+        Action<string> setName = null;
+
+        if (statsObj is ProcessNetworkStats netStats)
+        {
+            processId = netStats.ProcessId;
+            setName = (name) => netStats.ProcessName = name;
+        }
+        else if (statsObj is ProcessDiskStats diskStats)
+        {
+            processId = diskStats.ProcessId;
+            setName = (name) => diskStats.ProcessName = name;
+        }
+        else { return; } // Unknown stats type
+
+        if (processId == -1 || setName == null) { return; }
+
+        try
+        { 
+            using var process = Process.GetProcessById(processId);
+            setName(process?.ProcessName ?? "Unknown");
+        }
+        catch (ArgumentException) { /* Process likely exited */ }
+        catch (InvalidOperationException) { /* Process likely exited */ }
+        catch (Exception ex)
+        { 
+            _logger.LogWarning(ex, $"Could not resolve name for PID {processId}");
+        }
+    }
+
+    // Renamed from LogNetworkStats to LogStats to include Disk IO
+    // This is the Timer callback - must remain synchronous (void)
+    private void LogStats(object? state)
+    {
+        // Execute the async logic without awaiting directly in the timer callback
+        // Log any exceptions that occur during the async operation.
+        _ = Task.Run(async () => 
+        {
+             try
+             {
+                 await LogStatsAsync();
+             }
+             catch (Exception ex)
+             {
+                 _logger.LogError(ex, "An unhandled exception occurred during the async LogStats execution.");
+             }
+        });
+    }
+
+    // Contains the actual async logging logic
+    private async Task LogStatsAsync()
+    {
+        _logger.LogInformation("Logging stats...");
+        // _loggingTimer?.Change(Timeout.Infinite, Timeout.Infinite); // <<< Potential issue: Timer management needs care
+        // It might be better to pause/resume the timer within the synchronous LogStats method
+        // OR accept potential overlap if LogStatsAsync takes longer than _logInterval.
+        // For now, let's try pausing/resuming here but be aware of potential reentrancy issues if LogStatsAsync is slow.
+        Timer? timer = _loggingTimer;
+        if (timer == null) return; // Timer disposed or not set
+
+        // Try to prevent reentrancy by stopping the timer before async work
+        timer.Change(Timeout.Infinite, Timeout.Infinite);
+        _logger.LogDebug("LogStatsAsync: Timer paused.");
+
+        try
+        {
+            var statsToLog = new List<LogEntryBase>();
+            var networkStatsSnapshot = new Dictionary<int, (long Sent, long Received, string? TopIp)>();
+
+            // --- Process Network Stats FIRST ---
+            // Lock the dictionary while processing and clearing
+            lock (_processStats)
+            {
+                foreach (var kvp in _processStats)
+                {
+                    var processId = kvp.Key;
+                    var stats = kvp.Value;
+
+                    // 1. Get and reset network counts
+                    var (sent, received) = stats.GetAndResetIntervalCounts();
+
+                    // 2. Calculate Top IP *before* clearing
+                    string? topRemoteIp = null;
+                    long maxBytes = -1;
+                    var ipStatsSnapshot = stats.BytesPerRemoteIp.ToList(); // Take snapshot
+                    stats.BytesPerRemoteIp.Clear(); // Clear immediately after snapshot
+
+                    foreach (var ipKvp in ipStatsSnapshot)
+                    {
+                        long totalBytes = ipKvp.Value.BytesSent + ipKvp.Value.BytesReceived;
+                        if (totalBytes > maxBytes)
+                        {
+                            maxBytes = totalBytes;
+                            topRemoteIp = ipKvp.Key;
+                        }
+                    }
+
+                    // 3. Resolve name if needed and store results (even if process might be closing)
+                    if (sent > 0 || received > 0)
+                    {
+                        string processName = stats.ProcessName;
+                        if (processName == "Unknown")
+                        {
+                            // Try to resolve even if the process might be gone, it might still be cached briefly
+                            TryResolveProcessName(stats);
+                            processName = stats.ProcessName;
+                        }
+                        networkStatsSnapshot[processId] = (sent, received, topRemoteIp);
+                    }
+                }
+            } // End lock (_processStats)
+
+
+            // --- Process Disk Stats SECOND ---
+            // Process disk stats before cleanup as well
+            var diskStatsSnapshot = new Dictionary<int, (long ReadBytes, long WrittenBytes, long ReadOps, long WriteOps, string? TopReadFile, string? TopWriteFile, string ProcessName)>();
+            lock(_processDiskStats) // Lock disk stats during processing
+            {
+                foreach (var kvp in _processDiskStats)
+                {
+                    var processId = kvp.Key;
+                    var diskStats = kvp.Value;
+
+                    // 1. Get and reset disk counts, op counts, AND top files
+                    var (readBytes, writtenBytes, readOps, writeOps, topReadFile, topWriteFile) = diskStats.GetAndResetIntervalCounts();
+
+                    // 2. Store results if activity occurred
+                    if (readBytes > 0 || writtenBytes > 0 || readOps > 0 || writeOps > 0)
+                    {
+                        string processName = diskStats.ProcessName;
+                        if (processName == "Unknown")
+                        {
+                            TryResolveProcessName(diskStats);
+                            processName = diskStats.ProcessName;
+                        }
+                         diskStatsSnapshot[processId] = (readBytes, writtenBytes, readOps, writeOps, topReadFile, topWriteFile, processName);
+                    }
+                }
+            } // End lock (_processDiskStats)
+
+            // --- Aggregate Stats for Logging ---
+            // Combine network and disk stats using the snapshots
+            var allProcessIds = networkStatsSnapshot.Keys.Union(diskStatsSnapshot.Keys).ToList();
+
+            // *** ADDED DIAGNOSTIC LOGGING (Changed to Information level) ***
+            _logger.LogInformation($"LogStats: Processing stats. Current counts - Network: {_processStats.Count}, Disk: {_processDiskStats.Count}");
+            // Log counts of snapshot dictionaries as well, to see what's being considered for logging
+            _logger.LogInformation($"LogStats: Snapshot counts - Network: {networkStatsSnapshot.Count}, Disk: {diskStatsSnapshot.Count}. Unique PIDs with activity: {allProcessIds.Count}");
+
+
+            foreach (var processId in allProcessIds)
+            {
+                networkStatsSnapshot.TryGetValue(processId, out var netStats); // Returns default (0,0,null) if not found
+                diskStatsSnapshot.TryGetValue(processId, out var diskInfo);   // Returns default if not found
+
+                // Determine the process name (prefer disk stats name if available, otherwise network stats derived name, else "Unknown")
+                 string finalProcessName = "Unknown";
+                 if (diskInfo.ProcessName != null && diskInfo.ProcessName != "Unknown")
+                 {
+                     finalProcessName = diskInfo.ProcessName;
+                 }
+                 else if (networkStatsSnapshot.ContainsKey(processId)) // If we have network stats, try resolving from the original object
+                 {
+                     if (_processStats.TryGetValue(processId, out var originalNetStats)) // Check if original exists (might be removed by cleanup later)
+                     {
+                         if (originalNetStats.ProcessName != "Unknown")
+                             finalProcessName = originalNetStats.ProcessName;
+                         else // Try resolving one last time if it was unknown
+                         {
+                             TryResolveProcessName(originalNetStats);
+                             finalProcessName = originalNetStats.ProcessName;
+                         }
+                     }
+                 }
+
+
+                // Only log if there was *some* activity
+                if (netStats.Sent > 0 || netStats.Received > 0 || diskInfo.ReadBytes > 0 || diskInfo.WrittenBytes > 0 || diskInfo.ReadOps > 0 || diskInfo.WriteOps > 0)
+                {
+                    if (netStats.Sent > 0 || netStats.Received > 0)
+                    {
+                        statsToLog.Add(new NetworkUsageLog
+                        {
+                            Timestamp = DateTime.UtcNow,
+                            ProcessId = processId,
+                            ProcessName = finalProcessName,
+                            BytesSent = netStats.Sent,
+                            BytesReceived = netStats.Received,
+                            TopRemoteIpAddress = netStats.TopIp
+                        });
+                    }
+
+                     if (diskInfo.ReadBytes > 0 || diskInfo.WrittenBytes > 0 || diskInfo.ReadOps > 0 || diskInfo.WriteOps > 0)
+                     {
+                         statsToLog.Add(new DiskActivityLog
+                         {
+                             Timestamp = DateTime.UtcNow,
+                             ProcessId = processId,
+                             ProcessName = finalProcessName, // Use the same name for consistency
+                             BytesRead = diskInfo.ReadBytes,
+                             BytesWritten = diskInfo.WrittenBytes,
+                             ReadOperations = diskInfo.ReadOps,
+                             WriteOperations = diskInfo.WriteOps,
+                             TopReadFile = diskInfo.TopReadFile,
+                             TopWriteFile = diskInfo.TopWriteFile
+                         });
+                     }
+                }
+            }
+
+
+            // --- Log aggregated stats ---
+            if (statsToLog.Any())
+            {
+                // Pass the whole list to be bulk inserted
+                await LogToDatabaseAsync(statsToLog).ConfigureAwait(false); 
+                _logger.LogInformation("Successfully logged stats for {Count} entries.", statsToLog.Count); // Added success log
+            }
+            else
+            {
+                _logger.LogInformation("No significant activity detected in this interval. Skipping database log.");
+            }
+
+
+            // --- Clean up stale processes AFTER logging ---
+            var currentProcesses = Process.GetProcesses().Select(p => p.Id).ToHashSet();
+
+            // Clean up network stats
+            var staleNetPids = _processStats.Keys.Where(pid => !currentProcesses.Contains(pid)).ToList();
+            foreach (var pid in staleNetPids)
+            {
+                if (_processStats.TryRemove(pid, out _)) // Removed unused variable
+                {
+                    _logger.LogDebug($"Removed stale process stats for PID {pid} after logging.");
+                }
+            }
+
+            // Clean up disk stats
+            var staleDiskPids = _processDiskStats.Keys.Where(pid => !currentProcesses.Contains(pid)).ToList();
+            foreach (var pid in staleDiskPids)
+            {
+                if (_processDiskStats.TryRemove(pid, out _)) // Removed unused variable
+                {
+                    _logger.LogDebug($"Removed stale disk stats for PID {pid} after logging.");
+                }
+            }
+
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error retrieving or logging stats in LogStatsAsync.");
+        }
+        finally // Ensure timer is restarted
+        {
+             // Restart timer after work is done (or if an error occurred)
+            try
+            {
+                timer.Change(_logInterval, _logInterval);
+                 _logger.LogInformation("Stats logging cycle complete. Timer restarted.");
+            }
+             catch (ObjectDisposedException)
+             {
+                 // Ignore if the timer was disposed while the async work was happening (e.g., during shutdown)
+                 _logger.LogInformation("Timer was disposed during LogStatsAsync execution. Not restarting.");
+             }
+        }
+    }
+
+    // Updated LogToDatabaseAsync to handle bulk inserts
+    private async Task LogToDatabaseAsync(List<LogEntryBase> logEntries)
+    {
+        if (!logEntries.Any()) return;
+
+        _logger.LogDebug("Bulk logging {Count} entries to DB...", logEntries.Count);
+
+        try
+        {
+            using (var scope = _scopeFactory.CreateScope())
+            {
+                var dbContext = scope.ServiceProvider.GetRequiredService<NetworkMonitorDbContext>();
+
+                // Separate lists for bulk insertion
+                var networkLogs = logEntries.OfType<NetworkUsageLog>().ToList();
+                var diskLogs = logEntries.OfType<DiskActivityLog>().ToList();
+
+                // Perform Bulk Insert operations
+                if (networkLogs.Any())
+                {
+                    await dbContext.BulkInsertAsync(networkLogs).ConfigureAwait(false);
+                    _logger.LogDebug("Bulk inserted {Count} NetworkUsageLog entries.", networkLogs.Count);
+                }
+                if (diskLogs.Any())
+                {
+                    await dbContext.BulkInsertAsync(diskLogs).ConfigureAwait(false);
+                    _logger.LogDebug("Bulk inserted {Count} DiskActivityLog entries.", diskLogs.Count);
+                }
+
+                // --- REMOVED old individual add/save logic --- 
+                // // Add to the correct DbSet based on the actual type
+                // if (logEntry is NetworkUsageLog networkLog)
+                // {
+                //     // dbContext.NetworkUsageLogs.Add(networkLog); // <<< TEMPORARILY COMMENTED OUT FOR MEMORY TEST
+                // }
+                // else if (logEntry is DiskActivityLog diskLog)
+                // {
+                //     // dbContext.DiskActivityLogs.Add(diskLog); // <<< TEMPORARILY COMMENTED OUT FOR MEMORY TEST
+                // }
+                // else
+                // {
+                //     _logger.LogWarning("Attempted to log an unknown log entry type: {LogType}", logEntry.GetType().Name);
+                //     return; // Don't save if type is unknown
+                // }
+                // 
+                // // await dbContext.SaveChangesAsync().ConfigureAwait(false); // <<< TEMPORARILY COMMENTED OUT FOR MEMORY TEST
+                // // Simulate work without saving
+                // await Task.Delay(50); // Add a small delay to simulate some work if needed, adjust as necessary
+            }
+        }
+        catch (Exception ex)
+        { 
+             _logger.LogError(ex, "Failed to bulk log stats to database. Total entries attempted: {Count}", logEntries.Count);
+        }
+    }
+
+    // Optional UDP Handlers
+    // private void HandleUdpIpSend(UdpIpTraceData data)
+    // {
+    //     _logger.LogTrace($"PID: {data.ProcessID} UDP SENT {data.size} bytes to {data.daddr}:{data.dport}");
+    // }
+    //
+    // private void HandleUdpIpRecv(UdpIpTraceData data)
+    // {
+    //     _logger.LogTrace($"PID: {data.ProcessID} UDP RECV {data.size} bytes from {data.saddr}:{data.sport}");
+    // }
+
+    public override Task StopAsync(CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Worker stopping...");
+        // WFP Controller is disposed via the main Dispose method
+        return base.StopAsync(cancellationToken);
+    }
+
+    public override void Dispose()
+    {
+        _logger.LogInformation("Worker disposing...");
+        StopMonitoring();
+        _loggingTimer?.Dispose();
+        _wfpController?.Dispose(); // Ensure WFP controller is disposed
+        base.Dispose();
+        GC.SuppressFinalize(this);
+    }
+
+    private void StopMonitoring()
+    {
+        _etwSession?.Dispose();
+        _etwSession = null;
+        _logger.LogInformation("ETW session disposed.");
+    }
+
+    // Helper to check for Admin privileges (Example only - needs robust implementation)
+    // private static bool IsAdministrator()
+    // {
+    //     try
+    //     {
+    //         using (var identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+    //         {
+    //             var principal = new System.Security.Principal.WindowsPrincipal(identity);
+    //             return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+    //         }
+    //     }
+    //     catch (Exception ex)
+    //     {
+    //         // Log error
+    //         Console.WriteLine($"Error checking admin status: {ex.Message}"); // Replace with logging
+    //         return false;
+    //     }
+    // }
+}
