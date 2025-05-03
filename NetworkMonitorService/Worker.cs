@@ -134,13 +134,18 @@ public class Worker : BackgroundService
     private TraceEventDispatcher? _etwSource; // <<< Added field for ETW source
     private Timer? _loggingTimer;
     private Timer? _dailyResetTimer; // <<< Added timer for daily resets
+    private Timer? _restartTimer;
     private readonly TimeSpan _logInterval = TimeSpan.FromMinutes(1); // Log every minute
-    private readonly TimeSpan _cleanupInterval; // Cleanup entries older than 10 minutes
+    private readonly TimeSpan _restartInterval = TimeSpan.FromMinutes(15); //TimeSpan.FromHours(1); // Restart ETW session every hour
     private readonly IServiceProvider _serviceProvider; // Inject IServiceProvider to resolve DbContext scope
     private readonly ConcurrentDictionary<int, ProcessNetworkStats> _processStats = new();
     private readonly ConcurrentDictionary<int, ProcessDiskStats> _processDiskStats = new();
+    private readonly ConcurrentDictionary<int, (string Name, DateTime Timestamp)> _processNameCache = new(); // <<< Cache field with Timestamp
+    private readonly TimeSpan _processNameCacheDuration = TimeSpan.FromMinutes(5); // <<< Cache validity duration
     private readonly TimeSpan _persistenceInterval = TimeSpan.FromMinutes(1); // Persist every 1 minute
-    private readonly TimeSpan _inactivityThreshold = TimeSpan.FromMinutes(10); // Remove processes inactive for 10 minutes
+    private Task? _etwProcessingTask;
+    private CancellationTokenSource? _etwTaskCts;
+    private CancellationToken _serviceStoppingToken; // To store the main stopping token
 
     public Worker(ILogger<Worker> logger,
                   IServiceScopeFactory scopeFactory,
@@ -150,7 +155,6 @@ public class Worker : BackgroundService
         _logger = logger;
         _scopeFactory = scopeFactory; // Assign injected factory
         _monitorControlService = monitorControlService; // <<< Assign injected service
-        _cleanupInterval = TimeSpan.FromMinutes(10); // Cleanup entries older than 10 minutes
         _serviceProvider = serviceProvider;
 
         // Register the reset action with the control service
@@ -169,144 +173,48 @@ public class Worker : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        _logger.LogInformation("Initializing ETW session for network monitoring.");
-
-        string sessionName = "NetworkMonitorServiceSession"; // Must be unique
-        // TraceEventDispatcher? etwSource = null; // <<< Removed local variable declaration
+        _logger.LogInformation("Worker executing...");
+        _serviceStoppingToken = stoppingToken; // Store the token
 
         try
         {
-            _logger.LogDebug("Creating TraceEventSession...");
-            _etwSession = new TraceEventSession(sessionName, TraceEventSessionOptions.Create);
-            _logger.LogDebug("TraceEventSession created. Is session null? {IsNull}", _etwSession == null);
-
-            // Use a cancellation token source linked to the service stopping token
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-
-            // Register cancellation callback to dispose the session and timer
-            stoppingToken.Register(() =>
-            {
-                _logger.LogInformation("Stopping token received, disposing resources.");
-                _loggingTimer?.Change(Timeout.Infinite, 0); // Stop the timer
-                StopMonitoring();
-                cts.Cancel(); // Signal cancellation to the processing task
-            });
-
-            _logger.LogDebug("Enabling Kernel Providers (NetworkTCPIP, FileIO, FileIOInit)...");
-            // Enable Kernel Network Events AND File I/O Events
-            _etwSession!.EnableKernelProvider(
-                KernelTraceEventParser.Keywords.NetworkTCPIP |
-                KernelTraceEventParser.Keywords.FileIO |       // Use FileIO for file name info
-                KernelTraceEventParser.Keywords.FileIOInit    // Use FileIOInit for file name info
-                );
-            _logger.LogDebug("Kernel Providers enabled.");
-            _logger.LogInformation("*** DIAGNOSTIC: Kernel providers enabled successfully. ***");
-
-            // Check if Source is available
-            if (_etwSession == null)
-            {
-                _logger.LogError("ETW Session is null before trying to access Source.");
-                throw new InvalidOperationException("ETW Session became null unexpectedly.");
-            }
-            // etwSource = _etwSession.Source; // <<< Assign to class field instead
-            _etwSource = _etwSession.Source;
-            _logger.LogDebug("ETW Session Source acquired. Is source null? {IsNull}", _etwSource == null);
-
-            if (_etwSource == null)
-            {
-                _logger.LogError("ETW Session Source is null, cannot subscribe to events.");
-                throw new InvalidOperationException("ETW Session Source is null after enabling providers.");
-            }
-
-            // Check if Kernel source is available
-            // var kernelSource = etwSource.Kernel; // <<< Use class field
-            var kernelSource = _etwSource.Kernel;
-             _logger.LogDebug("Kernel Source acquired. Is kernel source null? {IsNull}", kernelSource == null);
-
-             if (kernelSource == null)
-             {
-                 _logger.LogError("Kernel Source is null, cannot subscribe to kernel events.");
-                 throw new InvalidOperationException("Kernel Source is null after acquiring session source.");
-             }
-
-            // Set up direct event handlers
-             _logger.LogDebug("Subscribing to Kernel events (TcpIpRecv, TcpIpSend)...");
-            kernelSource.TcpIpRecv += HandleTcpIpRecv;
-            kernelSource.TcpIpSend += HandleTcpIpSend;
-
-            // Subscribe to specific Disk IO events
-            _logger.LogDebug("Subscribing to FileIO events (FileIORead, FileIOWrite)...");
-            kernelSource.FileIORead += HandleFileIoRead;   // Use FileIORead
-            kernelSource.FileIOWrite += HandleFileIoWrite; // Use FileIOWrite
-
-            _logger.LogInformation("*** DIAGNOSTIC: Subscribed FileIORead/Write handlers. ***");
-
-             _logger.LogDebug("Kernel event subscriptions complete.");
+            // Start initial ETW monitoring
+            _etwProcessingTask = StartEtwMonitoringAsync(); 
 
             // Set up periodic logging timer
-             _logger.LogDebug("Setting up logging timer...");
+            _logger.LogDebug("Setting up logging timer...");
             _loggingTimer = new Timer(LogStats, null, _logInterval, _logInterval);
-             _logger.LogDebug("Logging timer set up.");
+            _logger.LogDebug("Logging timer set up.");
 
             // Set up daily reset timer
             _logger.LogDebug("Setting up daily reset timer...");
-            ScheduleDailyResetTimer(stoppingToken); // <<< Schedule the daily timer
+            ScheduleDailyResetTimer(); 
             _logger.LogDebug("Daily reset timer scheduled.");
 
-            // Process events on a separate thread
-            _logger.LogInformation("Starting ETW event processing task...");
-            var etwTask = Task.Run(() =>
-            {
-                // Capture the source for use in the task
-                // var sourceToProcess = etwSource; // <<< Use class field directly, it's thread-safe
-                try
-                {
-                     _logger.LogInformation("ETW Task: Checking if _etwSource is null..."); // <<< Use field
-                     if (_etwSource != null) // <<< Use field
-                     {
-                         _logger.LogInformation("*** DIAGNOSTIC: ETW Task starting Source.Process()... ***");
-                         _logger.LogInformation("ETW Task: Calling Source.Process()...");
-                         _etwSource.Process(); // <<< Use field
-                         _logger.LogInformation("ETW Task: Source.Process() completed normally.");
-                         _logger.LogInformation("*** DIAGNOSTIC: ETW Task Source.Process() finished normally. ***");
-                     }
-                     else
-                     {
-                         _logger.LogError("ETW Task: _etwSource is null, cannot process events."); // <<< Use field
-                     }
-                }
-                catch (OperationCanceledException) { 
-                    _logger.LogInformation("ETW processing cancelled.");
-                    _logger.LogWarning("*** DIAGNOSTIC: ETW Task Source.Process() cancelled. ***");
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error during ETW event processing.");
-                    _logger.LogError(ex, "*** DIAGNOSTIC: ETW Task Source.Process() threw exception. ***");
-                }
-                finally
-                {
-                    _logger.LogInformation("ETW event processing stopped.");
-                    _logger.LogInformation("*** DIAGNOSTIC: ETW Task finally block reached. ***");
-                    // Ensure session is disposed if Process() exits unexpectedly
-                    StopMonitoring(); 
-                }
-            }, cts.Token); 
+            // Set up periodic ETW restart timer
+             _logger.LogDebug("Setting up ETW restart timer...");
+             _restartTimer = new Timer(RestartTimerCallback, null, _restartInterval, _restartInterval);
+             _logger.LogDebug("ETW restart timer set up.");
 
-            // Wait for only the ETW task to complete or cancellation
-            await etwTask.ConfigureAwait(false);
+            // Keep the service alive while background tasks run
+            _logger.LogInformation("Worker running. Waiting for stop signal...");
+            await Task.Delay(Timeout.Infinite, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // When Task.Delay is cancelled by stoppingToken
+            _logger.LogInformation("Worker execution canceled gracefully.");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to initialize ETW session. Ensure the service runs with administrative privileges.");
-            // Consider calling StopMonitoring here as well, although Dispose should handle it
-            StopMonitoring(); // <<< Add cleanup on initialization failure
-            return; // Exit if session creation fails
+            _logger.LogError(ex, "Unhandled exception during worker execution. The service might stop.");
+            // Consider stopping the host application depending on the severity
+            StopMonitoring(); // Ensure ETW cleanup even on unexpected errors
         }
         finally
         {
-            // <<< No need to dispose _etwSource here, it's handled by StopAsync/Dispose -> StopMonitoring
-             _logger.LogInformation("ExecuteAsync finished.");
+            _logger.LogInformation("Worker ExecuteAsync finishing.");
+            // StopMonitoring() is called by Dispose, which should be triggered by host shutdown
         }
     }
 
@@ -362,6 +270,97 @@ public class Worker : BackgroundService
 
     // --- ETW Handling and Logging (mostly unchanged) ---
 
+    private Task StartEtwMonitoringAsync()
+    {
+        _logger.LogInformation("Starting new ETW monitoring session setup...");
+        string sessionName = "NetworkMonitorServiceSession"; // Base name
+
+        // Clean up any previous resources explicitly, though StopMonitoring should handle this
+        _etwTaskCts?.Cancel(); // Cancel previous task if any
+        _etwTaskCts?.Dispose();
+        StopMonitoring(); // Ensure previous session is fully disposed
+
+        try
+        {
+            _logger.LogDebug("Creating TraceEventSession...");
+            _etwSession = new TraceEventSession(sessionName, TraceEventSessionOptions.Create);
+            _logger.LogDebug("TraceEventSession created.");
+
+            // Create a new CTS linked to the main service stopping token
+            _etwTaskCts = CancellationTokenSource.CreateLinkedTokenSource(_serviceStoppingToken);
+
+            // Register cancellation for the main service token to also cancel our specific task CTS
+            // This ensures shutdown signals propagate correctly
+            _serviceStoppingToken.Register(() => _etwTaskCts?.Cancel()); 
+
+            _logger.LogDebug("Enabling Kernel Providers (NetworkTCPIP, FileIO, FileIOInit)... Awaiting admin rights if first time.");
+            // Enable Kernel Network Events AND File I/O Events
+            _etwSession!.EnableKernelProvider(
+                KernelTraceEventParser.Keywords.NetworkTCPIP |
+                KernelTraceEventParser.Keywords.FileIO |       
+                KernelTraceEventParser.Keywords.FileIOInit    
+                );
+            _logger.LogDebug("Kernel Providers enabled.");
+
+            // Get the source
+            _etwSource = _etwSession.Source;
+            if (_etwSource == null)
+            {
+                throw new InvalidOperationException("ETW Session Source is null after enabling providers.");
+            }
+            _logger.LogDebug("ETW Session Source acquired.");
+
+            // Get Kernel source
+            var kernelSource = _etwSource.Kernel;
+            if (kernelSource == null)
+            {
+                throw new InvalidOperationException("Kernel Source is null after acquiring session source.");
+            }
+            _logger.LogDebug("Kernel Source acquired.");
+
+            // Subscribe handlers
+            _logger.LogDebug("Subscribing to Kernel events...");
+            kernelSource.TcpIpRecv += HandleTcpIpRecv;
+            kernelSource.TcpIpSend += HandleTcpIpSend;
+            kernelSource.FileIORead += HandleFileIoRead;
+            kernelSource.FileIOWrite += HandleFileIoWrite;
+            _logger.LogDebug("Kernel event subscriptions complete.");
+
+            // Start processing on a background thread, passing the specific CTS token
+            _logger.LogInformation("Starting ETW event processing task...");
+            return Task.Run(() =>
+            {
+                try
+                {
+                    _logger.LogInformation("ETW Task: Calling Source.Process()...");
+                    _etwSource.Process(); // This blocks until stopped or session disposed
+                    _logger.LogInformation("ETW Task: Source.Process() completed normally.");
+                }
+                catch (OperationCanceledException) 
+                {
+                    _logger.LogInformation("ETW processing task cancelled (expected during restart or shutdown).");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Error during ETW event processing in background task.");
+                    // Consider if session needs disposal here - StopMonitoring might be called by outer handler
+                }
+                finally
+                {
+                    _logger.LogInformation("ETW event processing task finished execution.");
+                }
+            }, _etwTaskCts.Token); // Pass the specific token for this task
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to initialize ETW session. Check permissions and previous session state.");
+            StopMonitoring(); // Clean up on initialization failure
+            // Return a completed task with error state or rethrow? 
+            // Returning a faulted task allows ExecuteAsync to potentially log it if awaited (but we don't await now)
+            return Task.FromException(ex); 
+        }
+    }
+
     private void HandleTcpIpSend(TcpIpSendTraceData data)
     {
         // Pass remote IP address (destination for send)
@@ -416,16 +415,19 @@ public class Worker : BackgroundService
     {
         int processId = 0;
         Action<string> setName = null;
+        string? currentName = null; // <<< Variable to hold current name
 
         if (statsObj is ProcessNetworkStats netStats)
         {
             processId = netStats.ProcessId;
             setName = (name) => netStats.ProcessName = name;
+            currentName = netStats.ProcessName; // <<< Get current name
         }
         else if (statsObj is ProcessDiskStats diskStats) // <<< Added handling for ProcessDiskStats
         {
             processId = diskStats.ProcessId;
             setName = (name) => diskStats.ProcessName = name;
+            currentName = diskStats.ProcessName; // <<< Get current name
         }
         else
         {
@@ -436,15 +438,48 @@ public class Worker : BackgroundService
 
         if (processId == 0) return; // Don't try to resolve PID 0
 
+        // <<< Check cache first
+        if (_processNameCache.TryGetValue(processId, out var cacheEntry)) // <<< Get tuple
+        {
+            // Check if the cached entry is still valid
+            if ((DateTime.UtcNow - cacheEntry.Timestamp) < _processNameCacheDuration)
+            {
+                // Optional: Add a check here to see if the process still exists
+                // using Process.GetProcessById(processId) if PID reuse is a concern.
+                // For simplicity, we'll use the cached value directly for now.
+                if (currentName == "Unknown" || currentName != cacheEntry.Name) // Update if unknown or different
+                {
+                     setName?.Invoke(cacheEntry.Name);
+                     // _logger.LogDebug($"Using fresh cached name for PID {processId}: {cacheEntry.Name}");
+                }
+                return; // Found fresh entry in cache, no need to query system
+            }
+            else
+            {
+                // Cache entry expired, will proceed to resolve below
+                _logger.LogTrace("Cached name for PID {ProcessId} expired. Attempting re-resolution.", processId);
+            }
+        }
+
+        // <<< If not in cache OR expired, try to resolve
         try
         {
             using var process = Process.GetProcessById(processId);
             if (process != null && !string.IsNullOrEmpty(process.ProcessName))
             {
                 // Use null-coalescing operator ?? to provide a default value if ProcessName is null
-                setName?.Invoke(process.ProcessName ?? "Unknown"); // <<< Fix CS8600 warning
+                string resolvedName = process.ProcessName ?? "Unknown"; // <<< Fix CS8600 warning & store name
+                setName?.Invoke(resolvedName);
                 // _logger.LogDebug($"Resolved PID {processId} to Name: {process.ProcessName}");
+
+                // <<< Add or Update cache with current timestamp
+                var newCacheEntry = (Name: resolvedName, Timestamp: DateTime.UtcNow);
+                _processNameCache.AddOrUpdate(processId, newCacheEntry, (key, oldEntry) => newCacheEntry);
             }
+            // <<< Else: Process exists but name is null/empty - maybe cache "Unknown" or specific marker?
+            // else if (process != null) {
+            //    _processNameCache.TryAdd(processId, "Unknown (Resolved Empty)"); // Example
+            // }
         }
         catch (ArgumentException)
         {
@@ -452,11 +487,16 @@ public class Worker : BackgroundService
              _logger.LogDebug("Failed to resolve process name for PID {ProcessId} (Process likely exited).", processId);
             // Optionally remove the entry here if the process has exited
             // _processStats.TryRemove(processId, out _);
-             // Optionally set name to indicate exit? e.g., setName?.Invoke("<exited>");
+            // Optionally set name to indicate exit? e.g., setName?.Invoke("<exited>");
+
+             // <<< Cache that the process likely exited (optional, prevents repeated lookups)
+             // _processNameCache.TryAdd(processId, ("<exited>", DateTime.UtcNow)); // Example with timestamp
         }
         catch (Exception ex) // Catch other potential exceptions (e.g., Win32Exception for access denied)
         {
             _logger.LogError(ex, "Error resolving process name for PID {ProcessId}", processId);
+            // <<< Optionally cache error state?
+            // _processNameCache.TryAdd(processId, ("<error>", DateTime.UtcNow)); // Example with timestamp
         }
     }
 
@@ -493,7 +533,6 @@ public class Worker : BackgroundService
         // --- Process Network Stats ---
         _logger.LogDebug("Processing Network Stats for logging. Count: {Count}", _processStats.Count);
         var networkStatsToLog = new List<NetworkUsageLog>(); // <<< Correct class name
-        List<int> inactiveNetworkPids = new();
 
         foreach (var kvp in _processStats)
         {
@@ -505,15 +544,6 @@ public class Worker : BackgroundService
             {
                 TryResolveProcessName(stats);
             }
-
-            // Check for inactivity
-            // Use LastActivityTimestamp from ProcessNetworkStats
-            if ((now - stats.LastActivityTimestamp) > _inactivityThreshold)
-            {
-                inactiveNetworkPids.Add(processId);
-                continue; // Don't log inactive processes immediately, remove them later
-            }
-
 
             var (intervalSent, intervalReceived, topIp) = stats.GetAndResetIntervalStats(); // <<< Use new method
 
@@ -544,21 +574,12 @@ public class Worker : BackgroundService
         }
         logEntries.AddRange(networkStatsToLog);
 
-        // Remove inactive network processes
-        foreach (var pid in inactiveNetworkPids)
-        {
-            if (_processStats.TryRemove(pid, out var removedStats))
-            {
-                _logger.LogInformation("Removed inactive network process: PID {ProcessId} ({ProcessName})", pid, removedStats.ProcessName);
-            }
-        }
-        _logger.LogDebug("Finished processing Network Stats. Active: {ActiveCount}, Inactive Removed: {InactiveCount}", _processStats.Count, inactiveNetworkPids.Count);
+        _logger.LogDebug("Finished processing Network Stats. Active: {ActiveCount}", _processStats.Count);
 
 
         // --- Process Disk Stats ---
         _logger.LogDebug("Processing Disk Stats for logging. Count: {Count}", _processDiskStats.Count);
         var diskStatsToLog = new List<DiskActivityLog>(); // Assuming DiskActivityLog model exists // <<< Correct class name
-        List<int> inactiveDiskPids = new();
 
         foreach (var kvp in _processDiskStats)
         {
@@ -570,14 +591,6 @@ public class Worker : BackgroundService
             {
                 TryResolveProcessName(stats);
             }
-
-            // Check for inactivity (using LastActivity from ProcessDiskStats)
-             if ((now - stats.LastActivity) > _inactivityThreshold)
-            {
-                inactiveDiskPids.Add(processId);
-                continue; // Don't log inactive processes immediately, remove them later
-            }
-
 
             var (intervalRead, intervalWritten, intervalReadOps, intervalWriteOps, topReadFile, topWriteFile) = stats.GetAndResetIntervalStats(); // <<< Use new method
 
@@ -611,15 +624,7 @@ public class Worker : BackgroundService
         }
          logEntries.AddRange(diskStatsToLog); // Add disk logs to the common list
 
-        // Remove inactive disk processes
-        foreach (var pid in inactiveDiskPids)
-        {
-            if (_processDiskStats.TryRemove(pid, out var removedStats))
-            {
-                _logger.LogInformation("Removed inactive disk process: PID {ProcessId} ({ProcessName})", pid, removedStats.ProcessName);
-            }
-        }
-         _logger.LogDebug("Finished processing Disk Stats. Active: {ActiveCount}, Inactive Removed: {InactiveCount}", _processDiskStats.Count, inactiveDiskPids.Count);
+        _logger.LogDebug("Finished processing Disk Stats. Active: {ActiveCount}", _processDiskStats.Count);
 
         // --- Database Persistence ---
         if (logEntries.Any())
@@ -700,6 +705,7 @@ public class Worker : BackgroundService
 
                 await transaction.CommitAsync();
                 _logger.LogInformation("Successfully committed {TotalCount} log entries to the database.", logEntries.Count);
+                CleanupStaleProcesses();
             }
 
             catch (Exception ex)
@@ -711,6 +717,67 @@ public class Worker : BackgroundService
             }
         });
     }
+
+    // +++ Add new cleanup method +++
+    private void CleanupStaleProcesses()
+    {
+        _logger.LogDebug("--- Starting Stale Process Cleanup --- Current Counts - Network: {NetCount}, Disk: {DiskCount}", _processStats.Count, _processDiskStats.Count);
+        int networkRemovedCount = 0;
+        int diskRemovedCount = 0;
+
+        // Use Keys.ToList() to avoid modifying the collection while iterating
+        var currentNetworkPids = _processStats.Keys.ToList(); 
+        foreach (var pid in currentNetworkPids)
+        {
+            if (pid == 0) continue; // Skip PID 0
+            try
+            {
+                // Attempt to get the process. If it doesn't exist, ArgumentException is thrown.
+                using var process = Process.GetProcessById(pid);
+                // Optional: Could add checks here based on process.HasExited, but ArgumentException is sufficient for non-existence
+            }
+            catch (ArgumentException)
+            {
+                // Process doesn't exist, remove it from stats
+                if (_processStats.TryRemove(pid, out var removedStats))
+                {
+                    _logger.LogInformation("Removing stale network process entry: PID {ProcessId} ({ProcessName})", pid, removedStats.ProcessName ?? "Unknown");
+                    networkRemovedCount++;
+                }
+            }
+            catch (Exception ex) // Catch other potential errors (e.g., permission denied)
+            {
+                _logger.LogWarning(ex, "Error checking process status for PID {ProcessId} during network cleanup. Entry will not be removed.", pid);
+            }
+        }
+
+        var currentDiskPids = _processDiskStats.Keys.ToList();
+        foreach (var pid in currentDiskPids)
+        {
+             if (pid == 0) continue; // Skip PID 0
+            try
+            {
+                using var process = Process.GetProcessById(pid);
+            }
+            catch (ArgumentException)
+            {
+                // Process doesn't exist, remove it from disk stats
+                if (_processDiskStats.TryRemove(pid, out var removedStats))
+                {
+                    _logger.LogInformation("Removing stale disk process entry: PID {ProcessId} ({ProcessName})", pid, removedStats.ProcessName ?? "Unknown");
+                    diskRemovedCount++;
+                }
+            }
+             catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error checking process status for PID {ProcessId} during disk cleanup. Entry will not be removed.", pid);
+            }
+        }
+
+        _logger.LogDebug("--- Finished Stale Process Cleanup --- Removed Network: {NetworkRemoved}, Disk: {DiskRemoved}. Remaining - Network: {NetCount}, Disk: {DiskCount}", 
+            networkRemovedCount, diskRemovedCount, _processStats.Count, _processDiskStats.Count);
+    }
+    // +++ End new cleanup method +++
 
     // Optional UDP Handlers
     // private void HandleUdpIpSend(UdpIpTraceData data)
@@ -742,45 +809,48 @@ public class Worker : BackgroundService
     private void StopMonitoring()
     {
         _logger.LogInformation("Stopping ETW monitoring session...");
+        // Note: No explicit lock here, assumes Dispose and Restart don't run concurrently in a problematic way.
+        // If race conditions observed, a lock might be needed around access to _etwSession/_etwSource/_etwTaskCts
         try
         {
             // Unsubscribe events first to prevent potential race conditions during disposal
             if (_etwSource?.Kernel != null)
             {
                 _logger.LogDebug("Unsubscribing from Kernel ETW events.");
-                _etwSource.Kernel.TcpIpRecv -= HandleTcpIpRecv;
-                _etwSource.Kernel.TcpIpSend -= HandleTcpIpSend;
-                _etwSource.Kernel.FileIORead -= HandleFileIoRead;
-                _etwSource.Kernel.FileIOWrite -= HandleFileIoWrite;
+                try { _etwSource.Kernel.TcpIpRecv -= HandleTcpIpRecv; } catch { /* Ignore */ }
+                try { _etwSource.Kernel.TcpIpSend -= HandleTcpIpSend; } catch { /* Ignore */ }
+                try { _etwSource.Kernel.FileIORead -= HandleFileIoRead; } catch { /* Ignore */ }
+                try { _etwSource.Kernel.FileIOWrite -= HandleFileIoWrite; } catch { /* Ignore */ }
             }
-            else {
-                 _logger.LogDebug("ETW Source or Kernel was null, skipping event unsubscription.");
+            else
+            {
+                _logger.LogDebug("ETW Source or Kernel was null, skipping event unsubscription.");
             }
 
             // Dispose the source
             if (_etwSource != null)
             {
-                 _logger.LogDebug("Disposing ETW Source...");
-                _etwSource.Dispose();
-                _etwSource = null; // Set to null after disposal
-                 _logger.LogDebug("ETW Source disposed.");
+                _logger.LogDebug("Disposing ETW Source...");
+                try { _etwSource.Dispose(); } catch (Exception ex) { _logger.LogError(ex, "Error disposing ETW source."); }
+                _etwSource = null; // Set to null after disposal attempt
+                _logger.LogDebug("ETW Source disposal attempt finished.");
             }
 
             // Dispose the session
             if (_etwSession != null)
             {
-                 _logger.LogDebug("Disposing ETW Session...");
-                _etwSession.Dispose();
-                _etwSession = null; // Set to null after disposal
-                 _logger.LogDebug("ETW Session disposed.");
+                _logger.LogDebug("Disposing ETW Session...");
+                try { _etwSession.Dispose(); } catch (Exception ex) { _logger.LogError(ex, "Error disposing ETW session."); }
+                _etwSession = null; // Set to null after disposal attempt
+                _logger.LogDebug("ETW Session disposal attempt finished.");
             }
         }
         catch (Exception ex)
         {
             // Log errors during disposal but don't prevent other cleanup
-            _logger.LogError(ex, "Error during ETW session disposal.");
+            _logger.LogError(ex, "Error during ETW session StopMonitoring routine.");
         }
-        _logger.LogInformation("ETW monitoring session stopped.");
+        _logger.LogInformation("ETW monitoring session stop attempt finished.");
     }
 
     public AllProcessStatsDto GetAllStats()
@@ -836,6 +906,70 @@ public class Worker : BackgroundService
 
     // --- Timer Callbacks & Control ---
 
+    private void RestartTimerCallback(object? state)
+    {
+        _logger.LogInformation("Restart timer triggered. Initiating ETW session restart.");
+        // Fire and forget - errors handled within RestartEtwSessionAsync
+        _ = RestartEtwSessionAsync();
+    }
+
+    private async Task RestartEtwSessionAsync()
+    {
+        _logger.LogWarning("--- Attempting to restart ETW session --- ");
+        try
+        {
+            // 1. Cancel the current processing task
+            if (_etwTaskCts != null && !_etwTaskCts.IsCancellationRequested)
+            {
+                _logger.LogDebug("Cancelling current ETW processing task...");
+                _etwTaskCts.Cancel();
+            }
+
+            // 2. Wait briefly for the task to finish (optional but good practice)
+            if (_etwProcessingTask != null && !_etwProcessingTask.IsCompleted)
+            {
+                _logger.LogDebug("Waiting briefly for current ETW task completion (max 2s). Status: {Status}", _etwProcessingTask.Status);
+                // Use a timeout to avoid waiting forever if cancellation hangs
+                var cancellationWaitTask = await Task.WhenAny(_etwProcessingTask, Task.Delay(TimeSpan.FromSeconds(2))).ConfigureAwait(false);
+                if (cancellationWaitTask != _etwProcessingTask)
+                {
+                     _logger.LogWarning("ETW processing task did not complete within the 2s cancellation timeout.");
+                }
+                else
+                {
+                    _logger.LogDebug("ETW processing task completed after cancellation signal. Status: {Status}", _etwProcessingTask.Status);
+                }
+            }
+
+            // 3. Stop and dispose the current session resources explicitly
+            // StopMonitoring handles disposal and nulling out fields.
+            _logger.LogDebug("Stopping and disposing current ETW resources...");
+            StopMonitoring();
+            // Explicitly null out task/CTS after stopping
+            _etwProcessingTask = null;
+            _etwTaskCts?.Dispose(); // Dispose the CTS used by the task
+            _etwTaskCts = null;
+
+            _logger.LogInformation("ETW Monitoring stopped. Starting new session...");
+
+            // 4. Start a new session 
+            // StartEtwMonitoringAsync uses the _serviceStoppingToken field, which is already set
+            _etwProcessingTask = StartEtwMonitoringAsync(); 
+
+            _logger.LogInformation("--- New ETW session started successfully --- ");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "--- Failed to restart ETW session --- ");
+            // Ensure cleanup is attempted even if restart fails
+            StopMonitoring(); 
+            _etwProcessingTask = null;
+            _etwTaskCts?.Dispose();
+            _etwTaskCts = null;
+            // Consider implications: monitoring will be stopped until next restart attempt or service restart.
+        }
+    }
+
     private void ResetDailyTotalsCallback(object? state)
     {
         // This callback is only responsible for calling the reset logic
@@ -845,7 +979,7 @@ public class Worker : BackgroundService
         // Reschedule the timer for the next midnight
         try
         {
-            ScheduleDailyResetTimer(CancellationToken.None); // Use CancellationToken.None as stoppingToken isn't available here directly
+            ScheduleDailyResetTimer();
             _logger.LogInformation("Daily reset timer rescheduled for next midnight.");
         }
         catch (Exception ex)
@@ -879,7 +1013,7 @@ public class Worker : BackgroundService
         }
     }
 
-    private void ScheduleDailyResetTimer(CancellationToken stoppingToken)
+    private void ScheduleDailyResetTimer()
     {
         try
         {
@@ -903,10 +1037,11 @@ public class Worker : BackgroundService
             _dailyResetTimer = new Timer(ResetDailyTotalsCallback, null, timeToMidnight, Timeout.InfiniteTimeSpan); // Fire once, then reschedule in callback
 
             // Ensure the timer is disposed if the service stops before it fires
-            if (stoppingToken.CanBeCanceled)
-            {
-                stoppingToken.Register(() => _dailyResetTimer?.Dispose());
-            }
+            // The main stopping token (_serviceStoppingToken) can be used here if needed for registration
+             if (_serviceStoppingToken.CanBeCanceled)
+             {
+                 _serviceStoppingToken.Register(() => _dailyResetTimer?.Dispose());
+             }
         }
         catch (Exception ex)
         {
