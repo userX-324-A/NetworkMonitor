@@ -138,7 +138,7 @@ public class Worker : BackgroundService
     private Timer? _dailyResetTimer; // <<< Added timer for daily resets
     private Timer? _restartTimer;
     private readonly TimeSpan _logInterval = TimeSpan.FromMinutes(1); // Log every minute
-    private readonly TimeSpan _restartInterval = TimeSpan.FromMinutes(15); //TimeSpan.FromHours(1); // Restart ETW session every hour
+    private readonly TimeSpan _restartInterval = TimeSpan.FromMinutes(60); //TimeSpan.FromHours(1); // Restart ETW session every hour
     private readonly IServiceProvider _serviceProvider; // Inject IServiceProvider to resolve DbContext scope
     private readonly ConcurrentDictionary<int, ProcessNetworkStats> _processStats = new();
     private readonly ConcurrentDictionary<int, ProcessDiskStats> _processDiskStats = new();
@@ -523,7 +523,7 @@ public class Worker : BackgroundService
     private async Task LogStatsAsync()
     {
         _logger.LogInformation("--- Starting periodic log cycle ---");
-        var now = DateTime.UtcNow;
+        var now = DateTime.Now;
         var logEntries = new List<LogEntryBase>(); // Base class or interface for common properties
 
         // +++ Log dictionary counts +++
@@ -731,60 +731,83 @@ public class Worker : BackgroundService
     private void CleanupStaleProcesses()
     {
         _logger.LogDebug("--- Starting Stale Process Cleanup --- Current Counts - Network: {NetCount}, Disk: {DiskCount}", _processStats.Count, _processDiskStats.Count);
-        int networkRemovedCount = 0;
-        int diskRemovedCount = 0;
+        int initialNetworkCount = _processStats.Count;
+        int initialDiskCount = _processDiskStats.Count;
+        int removedNetworkCount = 0;
+        int removedDiskCount = 0;
 
-        // Use Keys.ToList() to avoid modifying the collection while iterating
-        var currentNetworkPids = _processStats.Keys.ToList(); 
-        foreach (var pid in currentNetworkPids)
+        var allPids = Process.GetProcesses().Select(p => p.Id).ToHashSet();
+
+        // Cleanup Network Stats
+        var networkPidsToRemove = new List<int>();
+        foreach (var kvp in _processStats)
         {
-            if (pid == 0) continue; // Skip PID 0
-            try
+            int pid = kvp.Key;
+            var stats = kvp.Value;
+
+            // Condition 1: Process no longer exists
+            bool processExists = allPids.Contains(pid);
+            if (!processExists)
             {
-                // Attempt to get the process. If it doesn't exist, ArgumentException is thrown.
-                using var process = Process.GetProcessById(pid);
-                // Optional: Could add checks here based on process.HasExited, but ArgumentException is sufficient for non-existence
+                networkPidsToRemove.Add(pid);
+                continue; // Move to the next process if this one is gone
             }
-            catch (ArgumentException)
+
+            // Condition 2: Network activity is zero (only if process still exists)
+            if (stats.GetTotalBytesSent() == 0 && stats.GetTotalBytesReceived() == 0)
             {
-                // Process doesn't exist, remove it from stats
-                if (_processStats.TryRemove(pid, out var removedStats))
-                {
-                    _logger.LogInformation("Removing stale network process entry: PID {ProcessId} ({ProcessName})", pid, removedStats.ProcessName ?? "Unknown");
-                    networkRemovedCount++;
-                }
-            }
-            catch (Exception ex) // Catch other potential errors (e.g., permission denied)
-            {
-                _logger.LogWarning(ex, "Error checking process status for PID {ProcessId} during network cleanup. Entry will not be removed.", pid);
+                // Optionally log before removing based on zero activity
+                // _logger.LogTrace("Marking network PID {pid} ({name}) for removal due to zero activity.", pid, stats.ProcessName);
+                networkPidsToRemove.Add(pid);
             }
         }
 
-        var currentDiskPids = _processDiskStats.Keys.ToList();
-        foreach (var pid in currentDiskPids)
+        foreach (var pid in networkPidsToRemove)
         {
-             if (pid == 0) continue; // Skip PID 0
-            try
+            if (_processStats.TryRemove(pid, out var removedStats))
             {
-                using var process = Process.GetProcessById(pid);
-            }
-            catch (ArgumentException)
-            {
-                // Process doesn't exist, remove it from disk stats
-                if (_processDiskStats.TryRemove(pid, out var removedStats))
-                {
-                    _logger.LogInformation("Removing stale disk process entry: PID {ProcessId} ({ProcessName})", pid, removedStats.ProcessName ?? "Unknown");
-                    diskRemovedCount++;
-                }
-            }
-             catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Error checking process status for PID {ProcessId} during disk cleanup. Entry will not be removed.", pid);
+                _logger.LogDebug("Removed stale network process: PID {pid}, Name {Name}", pid, removedStats.ProcessName);
+                removedNetworkCount++;
             }
         }
 
-        _logger.LogDebug("--- Finished Stale Process Cleanup --- Removed Network: {NetworkRemoved}, Disk: {DiskRemoved}. Remaining - Network: {NetCount}, Disk: {DiskCount}", 
-            networkRemovedCount, diskRemovedCount, _processStats.Count, _processDiskStats.Count);
+        // Cleanup Disk Stats
+        var diskPidsToRemove = new List<int>();
+        foreach (var kvp in _processDiskStats)
+        {
+            int pid = kvp.Key;
+            var stats = kvp.Value;
+
+            // Condition 1: Process no longer exists
+            bool processExists = allPids.Contains(pid);
+            if (!processExists)
+            {
+                 // _logger.LogTrace("Marking disk PID {pid} ({name}) for removal because process not found.", pid, stats.ProcessName);
+                diskPidsToRemove.Add(pid);
+                continue; // Move to the next process if this one is gone
+            }
+
+            // Condition 2: Disk activity is zero (only if process still exists)
+            if (stats.GetTotalBytesRead() == 0 && stats.GetTotalBytesWritten() == 0)
+            {
+                 // _logger.LogTrace("Marking disk PID {pid} ({name}) for removal due to zero activity.", pid, stats.ProcessName);
+                diskPidsToRemove.Add(pid);
+            }
+        }
+
+        foreach (var pid in diskPidsToRemove)
+        {
+            if (_processDiskStats.TryRemove(pid, out var removedStats))
+            {
+                _logger.LogDebug("Removed stale disk process: PID {pid}, Name {Name}", pid, removedStats.ProcessName);
+                removedDiskCount++;
+            }
+        }
+
+
+        _logger.LogDebug("Finished stale process cleanup. Network: Initial={InitialNetwork}, Removed={RemovedNetwork}, Final={FinalNetwork}. Disk: Initial={InitialDisk}, Removed={RemovedDisk}, Final={FinalDisk}",
+                         initialNetworkCount, removedNetworkCount, _processStats.Count,
+                         initialDiskCount, removedDiskCount, _processDiskStats.Count);
     }
     // +++ End new cleanup method +++
 
