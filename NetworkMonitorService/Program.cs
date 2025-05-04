@@ -11,6 +11,8 @@ using Microsoft.AspNetCore.Builder; // Added for WebApplication
 using Microsoft.AspNetCore.Http; // Added for Results
 using Serilog; // Add Serilog namespace
 using Serilog.Events; // Required for LogEventLevel
+using Serilog.Debugging; // <<< Add for SelfLog
+using System.IO; // <<< Add for Path.Combine
 
 // Initialize Serilog's static logger BEFORE building the host for bootstrap logging
 // This allows logging issues during startup itself. It reads from appsettings.json.
@@ -20,6 +22,10 @@ Log.Logger = new LoggerConfiguration()
     .WriteTo.Console() // Log essential startup messages to console
     .CreateBootstrapLogger(); // Use CreateBootstrapLogger for early logging
 
+// <<< Enable Serilog SelfLog to output internal errors to Console.Error >>>
+// Change Console.Error to a file path if needed: SelfLog.Enable(writer => File.AppendAllText("C:\Path\To\SelfLog.txt", writer));
+SelfLog.Enable(Console.Error);
+
 try
 {
     Log.Information("Configuring Network Monitor Service host...");
@@ -27,29 +33,64 @@ try
     // Use WebApplication builder
     var builder = WebApplication.CreateBuilder(args);
 
-    // Configure host to use Serilog, reading details from configuration
+    // Configure host to use Serilog
     builder.Host.UseSerilog((hostContext, services, loggerConfiguration) => {
-        // Read the custom file size limit from the host's configuration
-        long? fileSizeLimitBytes = null;
-        if (hostContext.Configuration.GetValue<int?>("Logging:FileSizeLimitMB") is int fileSizeLimitMB && fileSizeLimitMB > 0)
-        {
-            fileSizeLimitBytes = fileSizeLimitMB * 1024 * 1024; // Convert MB to bytes
-        }
-
-        // Read base Serilog configuration (levels, console sink) from appsettings.json
+        // Read base Serilog configuration (levels, console sink etc.) first
         loggerConfiguration.ReadFrom.Configuration(hostContext.Configuration)
-            .Enrich.FromLogContext(); // Enrich logs with context
+            .Enrich.FromLogContext();
 
-        // Manually configure the File sink to apply the dynamic size limit
-        // We read other file args from config for consistency
-        loggerConfiguration.WriteTo.File(
-            path: hostContext.Configuration["Serilog:WriteTo:1:Args:path"] ?? "Logs/networkmonitor-.log",
-            rollingInterval: Enum.TryParse<RollingInterval>(hostContext.Configuration["Serilog:WriteTo:1:Args:rollingInterval"], true, out var interval) ? interval : RollingInterval.Day,
-            rollOnFileSizeLimit: bool.TryParse(hostContext.Configuration["Serilog:WriteTo:1:Args:rollOnFileSizeLimit"], out var roll) ? roll : true,
-            fileSizeLimitBytes: fileSizeLimitBytes, // Apply calculated size limit
-            retainedFileCountLimit: int.TryParse(hostContext.Configuration["Serilog:WriteTo:1:Args:retainedFileCountLimit"], out var count) ? count : 31,
-            outputTemplate: hostContext.Configuration["Serilog:WriteTo:1:Args:outputTemplate"] ?? "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}{Exception}"
-        );
+        // --- Programmatically configure File Sink with absolute path --- 
+        try 
+        { 
+            // Get Base Directory
+            var baseDirectory = AppContext.BaseDirectory;
+
+            // Read relative path and other args from config (adjust index [1] if File is not the second sink)
+            var relativePath = hostContext.Configuration["Serilog:WriteTo:1:Args:path"] ?? "Logs\\networkmonitor-.log";
+            var fullPath = Path.GetFullPath(Path.Combine(baseDirectory, relativePath)); // Ensure path is absolute and canonical
+
+            // Create directory if it doesn't exist
+            var logDirectory = Path.GetDirectoryName(fullPath);
+            if (!string.IsNullOrEmpty(logDirectory) && !Directory.Exists(logDirectory))
+            {
+                Directory.CreateDirectory(logDirectory);
+                Log.Information("Created log directory: {LogDirectory}", logDirectory); // Use bootstrap logger
+            }
+
+            // Read other arguments (provide defaults)
+            var rollInterval = Enum.TryParse<RollingInterval>(hostContext.Configuration["Serilog:WriteTo:1:Args:rollingInterval"], true, out var interval) ? interval : RollingInterval.Day;
+            var rollOnSize = bool.TryParse(hostContext.Configuration["Serilog:WriteTo:1:Args:rollOnFileSizeLimit"], out var roll) ? roll : true;
+            var fileSizeLimit = long.TryParse(hostContext.Configuration["Serilog:WriteTo:1:Args:fileSizeLimitBytes"], out var limit) ? limit : (long?)null; // Allow null for default
+            var retainCount = int.TryParse(hostContext.Configuration["Serilog:WriteTo:1:Args:retainedFileCountLimit"], out var count) ? count : 31;
+            var outputTemplate = hostContext.Configuration["Serilog:WriteTo:1:Args:outputTemplate"] ?? "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}{Exception}";
+            
+            // Read custom MB limit if needed (like before)
+            if (!fileSizeLimit.HasValue && hostContext.Configuration.GetValue<int?>("Logging:FileSizeLimitMB") is int fileSizeLimitMB && fileSizeLimitMB > 0)
+            {
+                fileSizeLimit = fileSizeLimitMB * 1024L * 1024L; // Use long literal
+            }
+
+            Log.Information("Configuring Serilog File Sink. Path: {FullPath}, RollingInterval: {RollInterval}, RollOnSize: {RollOnSize}, SizeLimit: {SizeLimitBytes}, RetainCount: {RetainCount}", 
+                fullPath, rollInterval, rollOnSize, fileSizeLimit, retainCount); // Log resolved config
+
+            // Explicitly configure the File sink, overriding any potential misconfiguration from ReadFrom.Configuration
+            loggerConfiguration.WriteTo.File(
+                path: fullPath, 
+                rollingInterval: rollInterval,
+                rollOnFileSizeLimit: rollOnSize,
+                fileSizeLimitBytes: fileSizeLimit,
+                retainedFileCountLimit: retainCount,
+                outputTemplate: outputTemplate
+                // Add other args like buffered: true, shared: true if needed
+            );
+        }
+        catch (Exception ex)
+        { 
+            Log.Error(ex, "Error occurred while programmatically configuring Serilog File Sink."); // Use bootstrap logger
+            // Log configuration values if possible to help diagnose
+            Log.Error("Relevant Config - Serilog:WriteTo:1:Args:path = {PathValue}", hostContext.Configuration["Serilog:WriteTo:1:Args:path"]);
+            // Consider throwing or letting the app continue without file logging
+        }
     });
 
     // Configure Windows Service options (if running as Windows Service)

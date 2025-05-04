@@ -22,6 +22,7 @@ using System.Linq;
 using System.Collections.Generic; // Added for List
 using System.Runtime.InteropServices; // For DllImport
 using NetworkMonitorService.Services; // <<< Add using for Services
+using Microsoft.Extensions.Configuration; // <<< Add for IConfiguration
 
 namespace NetworkMonitorService;
 
@@ -130,6 +131,7 @@ public class Worker : BackgroundService
     private readonly ILogger<Worker> _logger;
     private readonly IServiceScopeFactory _scopeFactory; // Ensure this is injected
     private readonly IMonitorControlService _monitorControlService; // <<< Inject control service
+    private readonly IConfiguration _configuration; // <<< Add IConfiguration field
     private TraceEventSession? _etwSession;
     private TraceEventDispatcher? _etwSource; // <<< Added field for ETW source
     private Timer? _loggingTimer;
@@ -146,16 +148,23 @@ public class Worker : BackgroundService
     private Task? _etwProcessingTask;
     private CancellationTokenSource? _etwTaskCts;
     private CancellationToken _serviceStoppingToken; // To store the main stopping token
+    private int _dataRetentionDays; // <<< Field to store retention period
 
     public Worker(ILogger<Worker> logger,
                   IServiceScopeFactory scopeFactory,
                   IServiceProvider serviceProvider,
-                  IMonitorControlService monitorControlService) // <<< Add service to constructor
+                  IMonitorControlService monitorControlService,
+                  IConfiguration configuration) // <<< Add IConfiguration injection
     {
         _logger = logger;
         _scopeFactory = scopeFactory; // Assign injected factory
         _monitorControlService = monitorControlService; // <<< Assign injected service
         _serviceProvider = serviceProvider;
+        _configuration = configuration; // <<< Assign injected configuration
+
+        // Read data retention period
+        _dataRetentionDays = _configuration.GetValue<int?>("DataRetentionDays") ?? 30; // Default to 30 if not found
+        _logger.LogInformation("Data retention period set to {RetentionDays} days.", _dataRetentionDays);
 
         // Register the reset action with the control service
         _monitorControlService.TriggerResetTotalCounts = PerformManualReset; // <<< Assign method to Action
@@ -972,21 +981,26 @@ public class Worker : BackgroundService
 
     private void ResetDailyTotalsCallback(object? state)
     {
-        // This callback is only responsible for calling the reset logic
-        // and rescheduling the timer.
-        PerformManualReset(); // <<< Call the shared reset logic
+        _logger.LogInformation("Executing daily reset callback...");
 
-        // Reschedule the timer for the next midnight
-        try
+        // Reset in-memory dictionaries (existing logic)
+        _logger.LogDebug("Resetting in-memory network/disk stat totals.");
+        foreach (var stats in _processStats.Values)
         {
-            ScheduleDailyResetTimer();
-            _logger.LogInformation("Daily reset timer rescheduled for next midnight.");
+            stats.ResetTotalCounts();
         }
-        catch (Exception ex)
+        foreach (var stats in _processDiskStats.Values)
         {
-             _logger.LogError(ex, "Failed to reschedule daily reset timer from callback.");
-             // Consider implications if rescheduling fails
+            stats.ResetTotalCounts();
         }
+        _logger.LogInformation("In-memory totals reset.");
+
+        // Purge old database records (new logic)
+        _ = PurgeOldDatabaseRecordsAsync(); // Run async, don't wait for completion here
+
+        // Reschedule the timer for the next day (existing logic)
+        ScheduleDailyResetTimer();
+        _logger.LogInformation("Daily reset timer rescheduled for next execution.");
     }
 
     /// <summary>
@@ -998,13 +1012,18 @@ public class Worker : BackgroundService
         _logger.LogInformation("--- Performing Reset of Total Counters and Clearing Process Lists ---"); // Updated log message
         try
         {
-            int networkCount = _processStats.Count; // Get count before clearing
-            _processStats.Clear(); // Clear the network stats dictionary
-            _logger.LogInformation("Cleared {Count} processes from network stats.", networkCount);
 
-            int diskCount = _processDiskStats.Count; // Get count before clearing
-            _processDiskStats.Clear(); // Clear the disk stats dictionary
-            _logger.LogInformation("Cleared {Count} processes from disk stats.", diskCount);
+            foreach (var stats in _processStats.Values)
+            {
+                stats.ResetTotalCounts();
+            }
+            _logger.LogInformation("Cleared totals for {Count} network stats.", _processStats.Count);
+
+            foreach (var stats in _processDiskStats.Values)
+            {
+                stats.ResetTotalCounts();
+            }
+            _logger.LogInformation("Cleared totals for {Count} disk stats.", _processDiskStats.Count);
 
         }
         catch (Exception ex)
@@ -1048,6 +1067,41 @@ public class Worker : BackgroundService
              _logger.LogError(ex, "Failed to schedule the daily reset timer.");
              _dailyResetTimer?.Dispose(); // Ensure disposal on error
              _dailyResetTimer = null;
+        }
+    }
+
+    // <<< New method to handle database purging asynchronously >>>
+    private async Task PurgeOldDatabaseRecordsAsync()
+    {
+        _logger.LogInformation("Starting database purge task for records older than {RetentionDays} days...", _dataRetentionDays);
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<NetworkMonitorDbContext>();
+
+            // Calculate cutoff date (UTC)
+            var cutoffDate = DateTime.UtcNow.AddDays(-_dataRetentionDays);
+            _logger.LogDebug("Calculated purge cutoff date (UTC): {CutoffDate}", cutoffDate);
+
+            // Purge DiskActivityLogs
+            _logger.LogDebug("Purging DiskActivityLogs older than {CutoffDate}...", cutoffDate);
+            var deletedDiskLogs = await dbContext.DiskActivityLogs
+                .Where(log => log.Timestamp < cutoffDate)
+                .ExecuteDeleteAsync(); // EF Core bulk delete
+            _logger.LogInformation("Purged {Count} old records from DiskActivityLogs.", deletedDiskLogs);
+
+            // Purge NetworkUsageLogs
+            _logger.LogDebug("Purging NetworkUsageLogs older than {CutoffDate}...", cutoffDate);
+            var deletedNetworkLogs = await dbContext.NetworkUsageLogs
+                .Where(log => log.Timestamp < cutoffDate)
+                .ExecuteDeleteAsync(); // EF Core bulk delete
+            _logger.LogInformation("Purged {Count} old records from NetworkUsageLogs.", deletedNetworkLogs);
+
+            _logger.LogInformation("Database purge task completed successfully.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error occurred during database purge task.");
         }
     }
 }
