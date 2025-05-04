@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using System.ComponentModel; // Required for INotifyPropertyChanged
 
-namespace NetworkMonitorService
+namespace NetworkMonitor.Shared.DTOs // Updated namespace
 {
     // Data Transfer Object for sending process stats via IPC
     public class ProcessStatsDto : INotifyPropertyChanged
@@ -34,10 +34,11 @@ namespace NetworkMonitorService
             set { if (_totalBytesReceived != value) { _totalBytesReceived = value; OnPropertyChanged(nameof(TotalBytesReceived)); } }
         }
 
-        private long _diskWrite;
+        // Note: DiskWrite seems out of place in a network stats DTO.
+        // Consider removing it or creating a combined DTO if necessary.
+        private long _diskWrite; 
         public long DiskWrite { get => _diskWrite; set { if (_diskWrite != value) { _diskWrite = value; OnPropertyChanged(nameof(DiskWrite)); } } }
 
-        // Add other fields as needed (e.g., rate, timestamps)
 
         public event PropertyChangedEventHandler? PropertyChanged;
 

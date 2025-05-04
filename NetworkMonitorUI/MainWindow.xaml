@@ -5,15 +5,20 @@
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
         xmlns:local="clr-namespace:NetworkMonitorUI"
         xmlns:materialDesign="http://materialdesigninxaml.net/winfx/xaml/themes" 
+        xmlns:viewModels="clr-namespace:NetworkMonitorUI.ViewModels" 
         mc:Ignorable="d"
         Title="Network and Disk Monitor" Height="600" Width="800"
-        Loaded="Window_Loaded"
         Closing="Window_Closing"
         TextElement.Foreground="{DynamicResource MaterialDesignBody}"
         Background="{DynamicResource MaterialDesignPaper}"
         TextElement.FontWeight="Regular"
         TextElement.FontSize="13"
         Icon="pack://application:,,,/icon.ico">
+
+    <!-- Set ViewModel as DataContext (optional, often done in code-behind or via DI) -->
+    <!-- <Window.DataContext>
+        <viewModels:MainWindowViewModel/>
+    </Window.DataContext> -->
 
     <Grid Margin="10">
         <Grid.RowDefinitions>
@@ -62,11 +67,14 @@
         <!-- Material Design Status Bar -->
         <StatusBar Grid.Row="1">
             <StatusBarItem>
-                <TextBlock x:Name="StatusTextBlock" Text="Ready"/>
+                <TextBlock Text="{Binding StatusText}"/>
             </StatusBarItem>
             <StatusBarItem HorizontalAlignment="Right">
-                <Button x:Name="ResetButton" Content="Reset Totals" Click="ResetButton_Click" Style="{StaticResource MaterialDesignFlatButton}" />
+                <Button Content="Reset Totals" 
+                        Command="{Binding ResetTotalsCommand}" 
+                        Style="{StaticResource MaterialDesignFlatButton}" />
             </StatusBarItem>
         </StatusBar>
+        
     </Grid>
 </Window>

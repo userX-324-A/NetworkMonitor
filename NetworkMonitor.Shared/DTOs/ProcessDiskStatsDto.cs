@@ -1,10 +1,10 @@
 using System.Collections.Generic;
-using System.ComponentModel; // Required for INotifyPropertyChanged if UI needs live updates within the DTO itself
+using System.ComponentModel; // Required for INotifyPropertyChanged
 
-namespace NetworkMonitorService // Use the same namespace as the service DTOs for compatibility
+namespace NetworkMonitor.Shared.DTOs // Updated namespace
 {
     /// <summary>
-    /// Data Transfer Object for representing disk I/O statistics for a single process (UI side).
+    /// Data Transfer Object for representing disk I/O statistics for a single process.
     /// Implements INotifyPropertyChanged for UI binding updates.
     /// </summary>
     public class ProcessDiskStatsDto : INotifyPropertyChanged
