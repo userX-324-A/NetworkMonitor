@@ -13,6 +13,7 @@ using Serilog; // Add Serilog namespace
 using Serilog.Events; // Required for LogEventLevel
 using Serilog.Debugging; // <<< Add for SelfLog
 using System.IO; // <<< Add for Path.Combine
+using NetworkMonitorService.Configuration; // <<< Add using for SerilogConfigurator
 
 // Initialize Serilog's static logger BEFORE building the host for bootstrap logging
 // This allows logging issues during startup itself. It reads from appsettings.json.
@@ -35,62 +36,7 @@ try
 
     // Configure host to use Serilog
     builder.Host.UseSerilog((hostContext, services, loggerConfiguration) => {
-        // Read base Serilog configuration (levels, console sink etc.) first
-        loggerConfiguration.ReadFrom.Configuration(hostContext.Configuration)
-            .Enrich.FromLogContext();
-
-        // --- Programmatically configure File Sink with absolute path --- 
-        try 
-        { 
-            // Get Base Directory
-            var baseDirectory = AppContext.BaseDirectory;
-
-            // Read relative path and other args from config (adjust index [1] if File is not the second sink)
-            var relativePath = hostContext.Configuration["Serilog:WriteTo:1:Args:path"] ?? "Logs\\networkmonitor-.log";
-            var fullPath = Path.GetFullPath(Path.Combine(baseDirectory, relativePath)); // Ensure path is absolute and canonical
-
-            // Create directory if it doesn't exist
-            var logDirectory = Path.GetDirectoryName(fullPath);
-            if (!string.IsNullOrEmpty(logDirectory) && !Directory.Exists(logDirectory))
-            {
-                Directory.CreateDirectory(logDirectory);
-                Log.Information("Created log directory: {LogDirectory}", logDirectory); // Use bootstrap logger
-            }
-
-            // Read other arguments (provide defaults)
-            var rollInterval = Enum.TryParse<RollingInterval>(hostContext.Configuration["Serilog:WriteTo:1:Args:rollingInterval"], true, out var interval) ? interval : RollingInterval.Day;
-            var rollOnSize = bool.TryParse(hostContext.Configuration["Serilog:WriteTo:1:Args:rollOnFileSizeLimit"], out var roll) ? roll : true;
-            var fileSizeLimit = long.TryParse(hostContext.Configuration["Serilog:WriteTo:1:Args:fileSizeLimitBytes"], out var limit) ? limit : (long?)null; // Allow null for default
-            var retainCount = int.TryParse(hostContext.Configuration["Serilog:WriteTo:1:Args:retainedFileCountLimit"], out var count) ? count : 31;
-            var outputTemplate = hostContext.Configuration["Serilog:WriteTo:1:Args:outputTemplate"] ?? "{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} [{Level:u3}] {Message:lj}{NewLine}{Exception}";
-            
-            // Read custom MB limit if needed (like before)
-            if (!fileSizeLimit.HasValue && hostContext.Configuration.GetValue<int?>("Logging:FileSizeLimitMB") is int fileSizeLimitMB && fileSizeLimitMB > 0)
-            {
-                fileSizeLimit = fileSizeLimitMB * 1024L * 1024L; // Use long literal
-            }
-
-            Log.Information("Configuring Serilog File Sink. Path: {FullPath}, RollingInterval: {RollInterval}, RollOnSize: {RollOnSize}, SizeLimit: {SizeLimitBytes}, RetainCount: {RetainCount}", 
-                fullPath, rollInterval, rollOnSize, fileSizeLimit, retainCount); // Log resolved config
-
-            // Explicitly configure the File sink, overriding any potential misconfiguration from ReadFrom.Configuration
-            loggerConfiguration.WriteTo.File(
-                path: fullPath, 
-                rollingInterval: rollInterval,
-                rollOnFileSizeLimit: rollOnSize,
-                fileSizeLimitBytes: fileSizeLimit,
-                retainedFileCountLimit: retainCount,
-                outputTemplate: outputTemplate
-                // Add other args like buffered: true, shared: true if needed
-            );
-        }
-        catch (Exception ex)
-        { 
-            Log.Error(ex, "Error occurred while programmatically configuring Serilog File Sink."); // Use bootstrap logger
-            // Log configuration values if possible to help diagnose
-            Log.Error("Relevant Config - Serilog:WriteTo:1:Args:path = {PathValue}", hostContext.Configuration["Serilog:WriteTo:1:Args:path"]);
-            // Consider throwing or letting the app continue without file logging
-        }
+        SerilogConfigurator.ConfigureSerilog(hostContext, loggerConfiguration); // <<< Use the new helper method
     });
 
     // Configure Windows Service options (if running as Windows Service)
@@ -130,8 +76,15 @@ try
     // Register the MonitorControlService as a Singleton
     builder.Services.AddSingleton<IMonitorControlService, MonitorControlService>();
 
-    // Add controllers support (if using controllers)
-    builder.Services.AddControllers();
+    // +++ Register the EtwMonitorService as a Singleton +++
+    builder.Services.AddSingleton<IEtwMonitorService, EtwMonitorService>();
+
+    // +++ Register the StatsRepository as Scoped (or Singleton if preferred, handles own scope) +++
+    // Let's use Singleton here as it manages its own scope via IServiceScopeFactory
+    builder.Services.AddSingleton<IStatsRepository, StatsRepository>();
+
+    // +++ Register the StatsAggregatorService as a Singleton +++
+    builder.Services.AddSingleton<IStatsAggregatorService, StatsAggregatorService>();
 
     // Add API explorer and Swagger services
     builder.Services.AddEndpointsApiExplorer();
@@ -150,33 +103,53 @@ try
         app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "NetworkMonitorService API v1"));
     }
 
-    // Map controllers (if using controllers)
-    app.MapControllers();
-
     // --- Define Minimal API Endpoints ---
 
-    // Endpoint to get current stats
-    app.MapGet("/stats", (Worker workerService) => workerService.GetAllStats());
+    // Endpoint to get current network stats
+    app.MapGet("/stats", (IStatsAggregatorService aggregator) => aggregator.GetCurrentNetworkStatsDto())
+        .WithName("GetNetworkStats")
+        .WithTags("Stats")
+        .Produces<AllProcessStatsDto>(StatusCodes.Status200OK);
 
     // Endpoint to get current disk stats
-    app.MapGet("/stats/disk", (Worker workerService, ILogger<Program> logger) => // Inject ILogger
+    app.MapGet("/stats/disk", (IStatsAggregatorService aggregator, ILogger<Program> logger) =>
     {
         try
         {
-            var stats = workerService.GetCurrentDiskStatsForDto();
+            var stats = aggregator.GetCurrentDiskStatsDto();
             return Results.Ok(stats);
         }
         catch (Exception ex)
         {
-            // Log the exception using Serilog
-            logger.LogError(ex, "Error getting disk stats"); // Use injected logger
+            logger.LogError(ex, "Error getting disk stats via API");
             return Results.Problem("An error occurred while fetching disk statistics.");
         }
     })
     .WithName("GetDiskStats")
-    .WithTags("Stats") // Group with other stats endpoints
+    .WithTags("Stats")
     .Produces<AllProcessDiskStatsDto>(StatusCodes.Status200OK)
     .Produces(StatusCodes.Status500InternalServerError);
+
+    // Endpoint to manually reset total counters
+    app.MapPost("/reset-totals", (IMonitorControlService controlService, ILogger<Program> logger) =>
+    {
+        logger.LogInformation("API request received to reset total counters.");
+        bool triggered = controlService.ResetTotalCounters();
+        if (triggered)
+        {
+            logger.LogInformation("ResetTotalCounters action successfully triggered via MonitorControlService.");
+            return Results.Ok("Total counters reset triggered successfully.");
+        }
+        else
+        {
+            logger.LogWarning("Failed to trigger reset via MonitorControlService. Trigger action might not be registered.");
+            return Results.NotFound("Reset action could not be triggered. Service might not be ready or action not registered.");
+        }
+    })
+    .WithName("ResetTotalCounters")
+    .WithTags("Control")
+    .Produces(StatusCodes.Status200OK)
+    .Produces(StatusCodes.Status404NotFound);
 
     // --- Optional: Auto-migration ---
     // Uncomment this block if you want the service to attempt to apply migrations on startup.

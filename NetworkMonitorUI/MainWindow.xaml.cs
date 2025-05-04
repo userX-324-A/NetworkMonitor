@@ -350,7 +350,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            var response = await sharedClient.PostAsync("/api/monitor/reset-totals", null);
+            var response = await sharedClient.PostAsync("/reset-totals", null);
             response.EnsureSuccessStatusCode(); // Throw exception if not successful
 
             // Clear the local collections on the UI thread
